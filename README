@@ -1,0 +1,4 @@
+A fast read-only io-cache for processing large files preferably over 1GB and above. User needn't focus on efficiently managing and reading the data off the file and could instead focus on processing his large data-sets in such files.
+Check test_iocache.c for usage. This is the first version and isn't stable.
+
+-Karthick (a.r.karthick@gmail.com)

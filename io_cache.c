@@ -38,6 +38,9 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <errno.h>
+#ifdef VALGRIND
+#define NDEBUG
+#endif
 #include <assert.h>
 #include <sys/types.h>
 #include <sys/param.h>
@@ -147,6 +150,77 @@ static int io_cache_mlock_enabled;
 static int io_cache_default_log_level = LOG_INFO;
 static pthread_once_t io_cache_rlimit_once = PTHREAD_ONCE_INIT;
 
+#ifdef VALGRIND
+
+static int alloc_map(io_cache_t *cache, io_cache_entry_t *cache_entry, long long size, loff_t offset)
+{
+    cache_entry->e_data = calloc(1, size);
+    assert(cache_entry->e_data != NULL);
+    /*
+     * Fake a cache entry with an offset as its going to be a zero sink.
+     */
+    cache_entry->e_offset = offset;
+    return 0;
+}
+
+static int free_map(io_cache_t *cache, io_cache_entry_t *cache_entry)
+{
+    assert(cache_entry->e_data != NULL);
+    free(cache_entry->e_data);
+    cache_entry->e_data = NULL;
+    cache_entry->e_offset = -1;
+    return 0;
+}
+
+#else
+
+static int alloc_map(io_cache_t *cache, io_cache_entry_t *cache_entry, long long size, loff_t offset)
+{
+    int err = -1;
+    char *map = mmap(0, size, PROT_READ, MAP_PRIVATE, cache->c_fd, offset);
+    if(map == MAP_FAILED)
+    {
+        log_error("Critical error [%s] trying to mmap chunk of size [%lld] at offset [%lld]\n",
+                  strerror(errno), size, (long long int) offset);
+        goto out;
+    }
+    IO_CACHE_MLOCK(map, size, err);
+    if(err < 0)
+    {
+        log_error("Critical error [%s] trying to mlock chunk of size [%lld] at offset [%lld]\n",
+                  strerror(errno), size, (long long int)offset);
+        munmap(map, size);
+        goto out;
+    }
+    cache_entry->e_data = map;
+    cache_entry->e_offset = offset;
+    err = 0;
+    out:
+    return err;
+}
+
+static int free_map(io_cache_t *cache, io_cache_entry_t *cache_entry)
+{
+    int err;
+    assert(cache_entry->e_data != NULL);
+    IO_CACHE_MUNLOCK(cache_entry->e_data, cache_entry->e_size);
+    err = munmap(cache_entry->e_data, cache_entry->e_size);
+    if(err == 0)
+    {
+        cache_entry->e_data = NULL;
+        cache_entry->e_offset = -1;
+    }
+    else
+    {
+        log_error("Error [%s] trying to munmap region [%p] at offset [%lld] of size [%lld]\n",
+                  strerror(errno), (void*)cache_entry->e_data, (long long int)cache_entry->e_offset,
+                  cache_entry->e_size);
+    }
+    return err;
+}
+
+#endif
+
 void log_output(FILE *fptr, int level, const char *fmt, ...)
 {
     va_list ptr;
@@ -171,11 +245,18 @@ static void io_cache_rlimit_enable(void)
         rlim.rlim_cur = RLIM_INFINITY;
         rlim.rlim_max = RLIM_INFINITY;
         if(setrlimit(RLIMIT_AS, &rlim) < 0)
+        {
             log(LOG_WARNING, "setrlimit for RLIMIT_AS failed with error [%s]. Try running as root\n", 
                        strerror(errno));
+            return;
+        }
         if(setrlimit(RLIMIT_MEMLOCK, &rlim) < 0)
+        {
             log(LOG_WARNING, "setrlimit for RLIMIT_MEMLOCK failed with error [%s]. Try running as root\n", 
                 strerror(errno));
+            return;
+        }
+        io_cache_mlock_enabled = 1;
     }
 }
 
@@ -275,7 +356,7 @@ static void *io_cache_aging_thread(void *arg)
     pthread_mutex_lock(&cache->c_active_mutex);
     while(cache->c_state & IO_CACHE_ACTIVE)
     {
-        task_pool_timeout_t timeout = {.sec = 5, .msec = 0};
+        task_pool_timeout_t timeout = {.sec = 1, .msec = 0};
         struct timespec tv = {0};
         long long reclaim_entries = 0;
         long long reclaim_size = 0;
@@ -292,7 +373,6 @@ static void *io_cache_aging_thread(void *arg)
             {
                 assert( !(cache_entry->e_flags & IO_CACHE_LIST_INACTIVE) );
                 active_cache_del_locked(cache, cache_entry);
-                cache_entry->e_flags |= IO_CACHE_LIST_INACTIVE;
                 list_add_tail(&cache_entry->e_inactive_list, &reclaim_list);
                 ++reclaim_entries;
             }
@@ -303,11 +383,9 @@ static void *io_cache_aging_thread(void *arg)
         list_for_each(iter, &reclaim_list)
         {
             cache_entry = list_entry(iter, io_cache_entry_t, e_inactive_list);
-            IO_CACHE_MUNLOCK(cache_entry->e_data, cache_entry->e_size);
-            munmap(cache_entry->e_data, cache_entry->e_size);
+            free_map(cache, cache_entry);
             reclaim_size += cache_entry->e_size;
-            cache_entry->e_data = NULL;
-            cache_entry->e_offset = -1;
+            cache_entry->e_flags |= IO_CACHE_LIST_INACTIVE;
         }
         /*
          * Move the reclaimed list into the inactive list of the cache. 
@@ -320,7 +398,6 @@ static void *io_cache_aging_thread(void *arg)
         pthread_mutex_lock(&cache->c_active_mutex);
         cache->c_stats.s_cur_size -= reclaim_size;
         cache->c_stats.s_cur_entries -= reclaim_entries;
-
         pthread_mutex_unlock(&cache->c_active_mutex);
 
         timeout_to_tv_abs(timeout, tv);
@@ -353,7 +430,7 @@ static int validate_cache_size(unsigned long long cache_size)
     ram_size = nr_pages * getpagesize();
     if(cache_size * 2 > ram_size)
     {
-        log_error("Cache size [%lld] is greater than 50%% of available ram size [%lld] bytes\n",
+        log_error("Cache size [%lld] is greater than twice of available ram size [%lld] bytes\n",
                   cache_size, ram_size);
         return -1;
     }
@@ -423,14 +500,10 @@ int io_cache_initialize(const char *filename, unsigned long long cache_size,
      */
     for(i = 0; i < cache->c_stats.s_entries; ++i)
     {
-        cache->c_cache[i].e_data = mmap(0, IO_CACHE_MMAP_CHUNK_SIZE, PROT_READ,
-                                        MAP_PRIVATE, fd, offset);
-        if(cache->c_cache[i].e_data == MAP_FAILED)
-        {
-            log_error("Mmap error [%s]\n", strerror(errno));
+        err = alloc_map(cache, &cache->c_cache[i], IO_CACHE_MMAP_CHUNK_SIZE, offset);
+        if(err < 0)
             goto out_mmap;
-        }
-        cache->c_cache[i].e_offset = offset;
+
         cache->c_cache[i].e_size = IO_CACHE_MMAP_CHUNK_SIZE;
         cache->c_cache[i].e_age = IO_CACHE_ENTRY_AGE;
         /*
@@ -439,52 +512,19 @@ int io_cache_initialize(const char *filename, unsigned long long cache_size,
         active_cache_add(cache, &cache->c_cache[i], 0);
         offset += IO_CACHE_MMAP_CHUNK_SIZE;
     }
-    
-    /*
-     * PIN the cache into memory
-     */
-    for(i = 0; i < cache->c_stats.s_entries; ++i)
-    {
-        err = mlock(cache->c_cache[i].e_data, cache->c_cache[i].e_size);
-        if(err < 0)
-        {
-            register int j;
-            log(LOG_WARNING, 
-                "mlock on mmapped chunk [%lld] failed with error [%s] for size [%lld]. Skipping mlock\n",
-                i, strerror(errno), cache->c_cache[i].e_size);
-            for(j = i-1; j >= 0; --j)
-                munlock(cache->c_cache[j].e_data, cache->c_cache[j].e_size);
 
-            goto do_madvise;
-        }
-    }
-    io_cache_mlock_enabled = 1;
-    goto skip_madvise;
-
-    do_madvise:
-    for(i = 0; i < cache->c_stats.s_entries; ++i)
-    {
-        err = madvise(cache->c_cache[i].e_data, cache->c_cache[i].e_size, MADV_SEQUENTIAL);
-        if(err < 0)
-        {
-            log(LOG_WARNING, 
-                "madvise on mmapped chunk [%lld] failed with error [%s] for size [%lld].\n",
-                i, strerror(errno), cache->c_cache[i].e_size);
-        }
-    }
-
-    skip_madvise:
     /*
      * We are here when the cache is pinned! Go ahead and create the task pools
      */
     err = task_pool_create(&cache->c_io_pool, IO_CACHE_MAX_POOL_THREADS, 0, 0);
     if(err < 0)
-        goto out_mlock;
+        goto out_mmap;
+    
     err = task_pool_create(&cache->c_aging_pool, 1, 0, 0);
     if(err < 0)
     {
         task_pool_delete(cache->c_io_pool);
-        goto out_mlock;
+        goto out_mmap;
     }
     /*
      * start the aging cache thread. after activating the cache.
@@ -495,40 +535,17 @@ int io_cache_initialize(const char *filename, unsigned long long cache_size,
     {
         task_pool_delete(cache->c_io_pool);
         task_pool_delete(cache->c_aging_pool);
-        goto out_mlock;
+        goto out_mmap;
     }
 
     *handle = (io_cache_handle_t)cache;
     goto out;
 
-    out_mlock:
-    if(io_cache_mlock_enabled > 0)
-    {
-        unsigned long long j;
-        for(j = 0; j < i; ++j)
-        {
-            err = munlock(cache->c_cache[j].e_data, cache->c_cache[j].e_size);
-            if(err < 0)
-            {
-                log(LOG_WARNING, "munlock for chunk [%lld] returned with error [%s]\n",
-                    j, strerror(errno));
-            }
-        }
-        i = cache->c_stats.s_entries;
-    }
-
     out_mmap:
     {
-        unsigned long long j;
+        long long j;
         for(j = 0; j < i; ++j)
-        {
-            err = munmap(cache->c_cache[j].e_data, cache->c_cache[j].e_size);
-            if(err < 0)
-            {
-                log(LOG_WARNING, "munmap for chunk [%lld] returned with error [%s]\n",
-                    j, strerror(errno));
-            }
-        }
+            free_map(cache, &cache->c_cache[j]);
     }
 
     free(cache);
@@ -560,7 +577,9 @@ static int io_cache_purge(io_cache_t *cache, io_cache_reclaim_t *reclaim_entry)
           &&
           !LIST_EMPTY(&cache->c_inactive_list))
     {
-        cache_entry = list_entry(cache->c_inactive_list.next, io_cache_entry_t, e_inactive_list);
+        struct list_head *reclaim = cache->c_inactive_list.next;
+        cache_entry = list_entry(reclaim, io_cache_entry_t, e_inactive_list);
+        assert(cache_entry->e_flags & IO_CACHE_LIST_INACTIVE);
         list_del(&cache_entry->e_inactive_list);
         list_add_tail(&cache_entry->e_inactive_list, &reclaim_entry->r_list);
         --cache->c_stats.s_inactive_entries;
@@ -598,6 +617,7 @@ static int io_cache_purge(io_cache_t *cache, io_cache_reclaim_t *reclaim_entry)
         list_for_each(iter, &cache->c_active_list)
         {
             cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
+            assert(cache_entry->e_flags & IO_CACHE_LIST_ACTIVE);
             if(cache_entry->e_refcnt > 0) 
                 continue;
             cache_entries[active_entries++] = cache_entry;
@@ -608,10 +628,7 @@ static int io_cache_purge(io_cache_t *cache, io_cache_reclaim_t *reclaim_entry)
         while(reclaim_entries > 0)
         {
             cache_entry = cache_entries[active_entries++];
-            IO_CACHE_MUNLOCK(cache_entry->e_data, cache_entry->e_size);
-            munmap(cache_entry->e_data, cache_entry->e_size);
-            cache_entry->e_data = NULL;
-            cache_entry->e_offset = -1;
+            free_map(cache, cache_entry);
             active_cache_del_locked(cache, cache_entry);
             list_add_tail(&cache_entry->e_inactive_list, &reclaim_entry->r_list);
             cache_entry->e_flags |= IO_CACHE_LIST_INACTIVE;
@@ -640,6 +657,25 @@ static int io_cache_purge(io_cache_t *cache, io_cache_reclaim_t *reclaim_entry)
     return err;
 }
 
+static void io_cache_verify(io_cache_t *cache)
+{
+    register struct list_head *iter;
+    list_for_each(iter, &cache->c_active_list)
+    {
+        io_cache_entry_t *cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
+        assert(cache_entry->e_refcnt == 0);
+    }
+    pthread_mutex_unlock(&cache->c_active_mutex);
+    pthread_mutex_lock(&cache->c_inactive_mutex);
+    list_for_each(iter, &cache->c_inactive_list)
+    {
+        io_cache_entry_t *cache_entry = list_entry(iter, io_cache_entry_t, e_inactive_list);
+        assert(cache_entry->e_refcnt == 0);
+    }
+    pthread_mutex_unlock(&cache->c_inactive_mutex);
+    pthread_mutex_lock(&cache->c_active_mutex);
+}
+
 /*
  * Called with the cache active_mutex held.
  */
@@ -652,16 +688,19 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
     io_cache_entry_t *cache_entry;
     long long ori_size;
     long long size;
+    long long count;
     loff_t cur_offset;
     loff_t end_offset;
-    loff_t align_offset;
+    loff_t from_offset;
     struct list_head *cache_intersect = NULL;
     io_cache_reclaim_t cache_reclaim = {0};
+    io_cache_entry_t **undo_list = NULL;
+    long long undo_list_entries = 0;
 
-    if(!cache || !buffer || offset < 0 || !len || *len <= 0)
+    if(!cache || !buffer || offset < 0 || !len)
         goto out;
 
-    if(offset >= cache->c_filesize)
+    if(offset >= cache->c_filesize || *len <= 0)
     {
         *len = 0;
         err = 0;
@@ -669,6 +708,11 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
     }
 
     ori_size = size = *len;
+
+    if(offset + size > cache->c_filesize)
+    {
+        ori_size = size = cache->c_filesize - offset;
+    }
 
     /*
      * If the request is greater than the cache size itself, fail it.
@@ -681,12 +725,14 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
     }
 
     LIST_HEAD_INIT(&cache_reclaim.r_list);
+    undo_list = calloc(cache->c_stats.s_entries, sizeof(*undo_list));
+    assert(undo_list != NULL);
 
-    if(offset + size > cache->c_filesize)
-    {
-        ori_size = size = cache->c_filesize - offset;
-    }
-
+#if 0 /* breaking my head on a bug which is resulting in a potential stale list head into the cache */
+    log(LOG_DEBUG, "Verifying IO cache before read at offset [%lld], size [%lld]\n",
+        (long long int)offset, ori_size);
+    io_cache_verify(cache);
+#endif
     /*
      * First step calculate the deficit and see if the cache is to be filled/extended.
      */
@@ -694,11 +740,9 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
     end_offset = cur_offset + size;
     list_for_each(iter, &cache->c_active_list)
     {
-        long long count = 0;
-        long long from_offset = 0;
         cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
 
-        if(end_offset < cache_entry->e_offset)
+        if(end_offset <= cache_entry->e_offset)
             break;
 
         if(cache_entry->e_offset + cache_entry->e_size <= offset)
@@ -720,39 +764,40 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
             }
             from_offset = cache_entry->e_offset;
         }
-        count = MIN(cache_entry->e_offset + cache_entry->e_size - cur_offset, cache_entry->e_size);
+        count = MIN(cache_entry->e_offset + cache_entry->e_size - from_offset, size);
         if(from_offset + count > end_offset)
             count = end_offset - from_offset;
+        undo_list[undo_list_entries++] = cache_entry;
         ++cache_entry->e_refcnt;
         if(cache_entry->e_refcnt == 1)
-        {
-            log(LOG_DEBUG, "Locking entry at offset [%lld], size [%lld]\n",
-                (long long int)cache_entry->e_offset, cache_entry->e_size);
             ++cache->c_stats.s_locked_entries;
-        }
         size -= count;
-        if(size <= 0 ) break;
+        if(size <= 0 ) 
+            break;
     }
 
-    if(size > 0 )
+    if(size > 0)
     {
         pthread_mutex_unlock(&cache->c_active_mutex);
         /*
          * Reclaim the cache entries required. 
          */
-        align_offset = cur_offset & ~IO_CACHE_MMAP_CHUNK_MASK;
-        size += cur_offset - align_offset; /* offset alignment skews*/
+        from_offset = offset & ~IO_CACHE_MMAP_CHUNK_MASK;
+        size += offset - from_offset; /* offset alignment skews*/
         size += IO_CACHE_MMAP_CHUNK_MASK;
         size &= ~IO_CACHE_MMAP_CHUNK_MASK;
         cache_reclaim.r_entries = size >> IO_CACHE_MMAP_CHUNK_SHIFT;
         err = io_cache_purge(cache, &cache_reclaim);
+        pthread_mutex_lock(&cache->c_active_mutex);
         if(err < 0)
         {
-            log_error("Cache read for size [%lld] failed as the cache is hot\n", size);
-            goto out;
+            log_error("Cache read for size [%lld] failed to reclaim [%lld] entries as the cache is hot\n", 
+                      size, cache_reclaim.r_entries);
+            goto out_undo;
         }
-        pthread_mutex_lock(&cache->c_active_mutex);
     }
+
+    err = -1;
     size = ori_size;
     /*
      * If we intersected, then try filling the holes here.
@@ -762,7 +807,6 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
         for(iter = cache_intersect; size > 0 && cur_offset < end_offset &&
                 iter != &cache->c_active_list; iter = next)
         {
-            long long count = 0;
             next = iter->next;
             cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
             if(cur_offset < cache_entry->e_offset) /* hole */
@@ -772,39 +816,19 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
                 cache_entry = list_entry(reclaim, io_cache_entry_t, e_inactive_list);
                 log(LOG_DEBUG, "Mapping entry at offset [%lld] of size [%lld]\n", 
                     (long long int)cur_offset, cache_entry->e_size);
-                cache_entry->e_data = mmap(0, cache_entry->e_size, PROT_READ, MAP_PRIVATE, 
-                                           cache->c_fd, cur_offset);
-                if(cache_entry->e_data == MAP_FAILED)
-                {
-                    /*
-                     * Move the reclaim entries to inactive list and fail
-                     */
-                    log_error("Critical error [%s] while trying to mmap cache entry of size [%lld] at offset [%lld]\n",
-                              strerror(errno), cache_entry->e_size, (long long int)cur_offset);
-                    cache_entry->e_data = NULL;
-                    goto out_merge;
-                }
-                IO_CACHE_MLOCK(cache_entry->e_data, cache_entry->e_size, err);
-                if(err < 0)
-                {
-                    log_error("Critical error [%s] while trying to mlock cache entry of size [%lld] at offset [%lld]\n",
-                              strerror(errno), cache_entry->e_size, (long long int)cur_offset);
-                    munmap(cache_entry->e_data, cache_entry->e_size);
-                    cache_entry->e_data = NULL;
-                    goto out_merge;
-                }
+                err = alloc_map(cache, cache_entry, cache_entry->e_size, cur_offset);
+                if(err < 0 )
+                    goto out_undo;
                 err = -1;
                 list_del(&cache_entry->e_inactive_list);
                 --cache_reclaim.r_entries;
                 cache_entry->e_flags &= ~IO_CACHE_LIST_INACTIVE;
-                list_add_tail(reclaim, iter); /* add the hole before this entry */
-                cache_entry->e_offset = cur_offset;
                 cache_entry->e_flags |= IO_CACHE_LIST_ACTIVE;
                 cache_entry->e_age = IO_CACHE_ENTRY_AGE;
+                list_add_tail(reclaim, iter); /* add the hole before this entry */
                 ++cache->c_stats.s_active_entries;
                 ++cache->c_stats.s_cur_entries;
                 cache->c_stats.s_cur_size += cache_entry->e_size;
-                cache_entry->e_offset = cur_offset;
                 count = MIN(cache_entry->e_size, size);
                 if(cur_offset + count > end_offset)
                     count = end_offset - cur_offset;
@@ -835,13 +859,6 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
                        cache_entry->e_data + cur_offset - cache_entry->e_offset,
                        count);
                 IO_CACHE_HIT(cache, cache_entry);
-                --cache_entry->e_refcnt;
-                if(cache_entry->e_refcnt == 0)
-                {
-                    log(LOG_DEBUG, "Unlocking entry at offset [%lld], size [%lld]\n",
-                        (long long int)cache_entry->e_offset, cache_entry->e_size);
-                    --cache->c_stats.s_locked_entries;
-                }
             }
             cur_offset += count;
             size -= count;
@@ -851,7 +868,7 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
     /*
      * Check for wrap arounds. so we start from the beginning
      */
-    if(size > 0 && cur_offset == end_offset)
+    if(size > 0 && cur_offset >= end_offset)
     {
         cur_offset = offset;
     }
@@ -865,32 +882,17 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
      */
     while(size > 0 && !LIST_EMPTY(&cache_reclaim.r_list))
     {
-        long long count;
-        cache_entry = list_entry(cache_reclaim.r_list.next, io_cache_entry_t, e_inactive_list);
+        struct list_head *reclaim = cache_reclaim.r_list.next;
+        cache_entry = list_entry(reclaim, io_cache_entry_t, e_inactive_list);
         log(LOG_DEBUG, "Mapping entry at offset [%lld] of size [%lld]\n", 
             (long long int)cur_offset, cache_entry->e_size);
-        cache_entry->e_data = mmap(0, cache_entry->e_size, PROT_READ, MAP_PRIVATE, cache->c_fd, cur_offset);
-        if(cache_entry->e_data == MAP_FAILED)
-        {
-            log_error("Critical error [%s] trying to mmap the cache entry of size [%lld] at offset [%lld]\n",
-                      strerror(errno), cache_entry->e_size, (long long int)cur_offset);
-            cache_entry->e_data = NULL;
-            goto out_merge;
-        }
-        IO_CACHE_MLOCK(cache_entry->e_data, cache_entry->e_size, err);
+        err = alloc_map(cache, cache_entry, cache_entry->e_size, cur_offset);
         if(err < 0)
-        {
-            log_error("Critical error [%s] trying to mlock the cache entry of size [%lld] at offset [%lld]\n",
-                      strerror(errno), cache_entry->e_size, (long long int)cur_offset);
-            munmap(cache_entry->e_data, cache_entry->e_size);
-            cache_entry->e_data = NULL;
-            goto out_merge;
-        }
+            goto out_undo;
         err = -1;
         list_del(&cache_entry->e_inactive_list);
         --cache_reclaim.r_entries;
         cache_entry->e_flags &= ~IO_CACHE_LIST_INACTIVE;
-        cache_entry->e_offset = cur_offset;
         cache_entry->e_age = IO_CACHE_ENTRY_AGE;
         active_cache_add_locked(cache, cache_entry, 1);
         ++cache->c_stats.s_cur_entries;
@@ -901,6 +903,7 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
         log(LOG_DEBUG, "Copying buffer to offset [%lld], from [%lld], count [%lld]\n",
             (long long int)(cur_offset - offset),
             (long long int)cur_offset, count);
+        assert(cur_offset >= cache_entry->e_offset);
         memcpy(buffer + cur_offset - offset,
                cache_entry->e_data + cur_offset - cache_entry->e_offset,
                count);
@@ -908,13 +911,34 @@ static int __io_cache_read(io_cache_handle_t handle, char *buffer, loff_t offset
         size -= count;
         IO_CACHE_MISS(cache, cache_entry);
     }
+
     cache->c_offset = end_offset;
     assert(size <= 0); /* we should have copied the entire buffer*/
     *len = ori_size;
     err = 0;
+
+    out_undo:
+    {
+        long long i;
+        for(i = 0; i < undo_list_entries; ++i)
+        {
+            cache_entry = undo_list[i];
+            --cache_entry->e_refcnt;
+            if(!cache_entry->e_refcnt)
+                --cache->c_stats.s_locked_entries;
+        }
+    }
+
+    free(undo_list);
+
+#if 0
+    log(LOG_DEBUG, "Verifying IO cache after read at offset [%lld], size [%lld]\n",
+        (long long int)offset, ori_size);
+    io_cache_verify(cache);
+#endif
+
     if(!LIST_EMPTY(&cache_reclaim.r_list))
     {
-        out_merge:
         log(LOG_WARNING, "Cache reclaim list not emptied. Marking them inactive\n");
         pthread_mutex_unlock(&cache->c_active_mutex);
         pthread_mutex_lock(&cache->c_inactive_mutex);
@@ -983,59 +1007,259 @@ static int __io_cache_entry_lock(io_cache_t *cache, loff_t offset, long long len
     int err = -1;
     io_cache_entry_t *cache_entry;
     register struct list_head *iter;
-    int intersect = 0;
-    long long count = 0;
-    loff_t end_offset;
+    struct list_head *next;
+    struct list_head *cache_intersect = NULL;
+    loff_t end_offset, cur_offset, from_offset;
+    long long size, ori_size, count = 0;
+    io_cache_reclaim_t cache_reclaim = {0};
+    io_cache_entry_t **undo_list;
+    long long undo_list_entries = 0;
 
-    if(!cache || offset < 0 || !len || !ref)
+    if(!cache || offset < 0 || !len || !ref) 
+        goto out;
+    
+    if(len > cache->c_stats.s_size || offset >= cache->c_filesize)
         goto out;
 
-    if(len > cache->c_stats.s_size || offset >= cache->c_filesize) 
-        goto out;
+    if(offset + len > cache->c_filesize)
+        len = cache->c_filesize - offset;
 
     end_offset = offset + len;
+    cur_offset = offset;
+    ori_size = size = len;
 
+    LIST_HEAD_INIT(&cache_reclaim.r_list);
+    undo_list = calloc(cache->c_stats.s_entries, sizeof(*undo_list)); /*the max it could grow*/
+    assert(undo_list != NULL);
     pthread_mutex_lock(&cache->c_active_mutex);
+    /*
+     * For unlock, there should be NO holes in the range being unlocked as the memory map
+     * should exist in the cache for that range.
+     */
+    if(ref < 0)
+    {
+        list_for_each(iter, &cache->c_active_list)
+        {
+            cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
+            if(end_offset <= cache_entry->e_offset)
+                break;
+            if(cache_intersect)
+            {
+                cur_offset = cache_entry->e_offset;
+            }
+            else if(offset >= cache_entry->e_offset
+                    &&
+                    offset < cache_entry->e_offset + cache_entry->e_size)
+            {
+                cache_intersect = iter;
+                cur_offset = offset;
+            }
+            else continue;
+
+            if(cache_entry->e_refcnt == 0) /* already unlocked*/
+            {
+                log(LOG_WARNING, "Cache entry at offset [%lld] already unlocked\n",
+                    (long long int)cache_entry->e_offset);
+                goto next;
+            }
+
+            undo_list[undo_list_entries++] = cache_entry;
+            cache_entry->e_refcnt += ref;
+            if(cache_entry->e_refcnt == 0)
+                --cache->c_stats.s_locked_entries;
+
+            next:
+            count = MIN(cache_entry->e_offset + cache_entry->e_size - cur_offset, size);
+            size -= count;
+            if(size <= 0)
+            {
+                pthread_mutex_unlock(&cache->c_active_mutex);
+                err = 0;
+                goto out_free;
+            }
+        }
+        goto out_undo; /* undo the changes done to the references on failure */
+    }
+    /*
+     * Here for lock
+     */
     list_for_each(iter, &cache->c_active_list)
     {
-        io_cache_entry_t *mark_entry = NULL;
         cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
-        if(end_offset < cache_entry->e_offset) break;
-        /*
-         * Since there could be holes, we just take the entire span after intersection.
-         */
-        if(intersect > 0)
-            mark_entry = cache_entry;
-        else if(offset >= cache_entry->e_offset
-                &&
-                offset < cache_entry->e_offset + cache_entry->e_size)
+        if(end_offset <= cache_entry->e_offset)
+            break;
+        if(cache_entry->e_offset + cache_entry->e_size <= offset)
+            continue;
+        if(offset >= cache_entry->e_offset
+           &&
+           offset < cache_entry->e_offset + cache_entry->e_size)
         {
-            /*
-             * Found the first entry that intersects. Mark all other entries till the span following
-             * this entry.
-             */
-            intersect = 1;
-            mark_entry = cache_entry;
+            cache_intersect = iter;
+            from_offset = cur_offset = offset;
         }
-        if(mark_entry)
+        else
         {
-            ++count;
-            cache_entry->e_refcnt += ref;
-            if(cache_entry->e_refcnt == 1 && ref > 0)
+            if(!cache_intersect)
             {
-                ++cache_entry->e_refcnt;
-                ++cache->c_stats.s_locked_entries;
+                cache_intersect = iter;
+                cur_offset = cache_entry->e_offset;
             }
-            else if(cache_entry->e_refcnt == 0)
-            {
-                --cache->c_stats.s_locked_entries;
-            }
-            
+            from_offset = cache_entry->e_offset;
+        }
+        count = MIN(cache_entry->e_offset + cache_entry->e_size - from_offset, size);
+        if(count + from_offset > end_offset)
+            count = end_offset - from_offset;
+        size -= count;
+        /*
+         * Grab reference count for lock
+         */
+        undo_list[undo_list_entries++] = cache_entry;
+        if(!cache_entry->e_refcnt)
+            ++cache->c_stats.s_locked_entries;
+        cache_entry->e_refcnt += ref;
+        if(size <= 0)
+        {
+            pthread_mutex_unlock(&cache->c_active_mutex);
+            err = 0;
+            goto out_free;
         }
     }
-    pthread_mutex_unlock(&cache->c_active_mutex);
-    err = count > 0 ? 0 : -1;
 
+    pthread_mutex_unlock(&cache->c_active_mutex);
+    /*
+     * Reclaim entries to pin them.
+     */
+    from_offset = offset & ~IO_CACHE_MMAP_CHUNK_MASK;
+    size += offset - from_offset;
+    size += IO_CACHE_MMAP_CHUNK_MASK;
+    size &= ~IO_CACHE_MMAP_CHUNK_MASK;
+    cache_reclaim.r_entries = size >> IO_CACHE_MMAP_CHUNK_SHIFT;
+    err = io_cache_purge(cache, &cache_reclaim);
+    pthread_mutex_lock(&cache->c_active_mutex);
+    if(err < 0)
+    {
+        log_error("Cache entry lock failed to reclaim [%lld] entries for size [%lld] as cache looks hot\n",
+                  cache_reclaim.r_entries, size);
+        goto out_undo;
+    }
+
+    err = -1;
+    size = ori_size;
+    if(cache_intersect)
+    {
+        for(iter = cache_intersect; size > 0 && cur_offset < end_offset &&
+                iter != &cache->c_active_list; iter = next)
+        {
+            next = iter->next;
+            cache_entry = list_entry(iter, io_cache_entry_t, e_active_list);
+            if(cur_offset < cache_entry->e_offset)
+            {
+                struct list_head *reclaim;
+                assert(!LIST_EMPTY(&cache_reclaim.r_list));
+                reclaim = cache_reclaim.r_list.next;
+                cache_entry = list_entry(reclaim, io_cache_entry_t, e_inactive_list);
+                err = alloc_map(cache, cache_entry, cache_entry->e_size, cur_offset);
+                if(err < 0)
+                    goto out_undo;
+                err = -1;
+                list_del(&cache_entry->e_inactive_list);
+                --cache_reclaim.r_entries;
+                cache_entry->e_flags &= ~IO_CACHE_LIST_INACTIVE;
+                cache_entry->e_flags |= IO_CACHE_LIST_ACTIVE;
+                cache_entry->e_age = IO_CACHE_ENTRY_AGE;
+                list_add_tail(reclaim, iter);
+                ++cache->c_stats.s_cur_entries;
+                ++cache->c_stats.s_active_entries;
+                cache->c_stats.s_cur_size += cache_entry->e_size;
+                IO_CACHE_MISS(cache, cache_entry);
+                undo_list[undo_list_entries++] = cache_entry;
+                if(!cache_entry->e_refcnt)
+                    ++cache->c_stats.s_locked_entries;
+                cache_entry->e_refcnt += ref;
+                next = iter; /*rescan the same entry*/
+            }
+            else
+            {
+                if(!cache_intersect)
+                    assert(cache_entry->e_offset == cur_offset);
+                else cache_intersect = NULL;
+                IO_CACHE_HIT(cache, cache_entry);
+            }
+            count = MIN(cache_entry->e_offset + cache_entry->e_size - cur_offset, 
+                        size);
+            if(count + cur_offset > end_offset)
+                count = end_offset - cur_offset;
+            cur_offset += count;
+            size -= count;
+        }
+    }
+
+    if(size > 0 && cur_offset >= end_offset) /* wrap */
+        cur_offset = offset;
+
+    cur_offset &= ~IO_CACHE_MMAP_CHUNK_MASK; /*align offset to the mmap chunk size*/
+    while(size > 0 && !LIST_EMPTY(&cache_reclaim.r_list))
+    {
+        struct list_head *reclaim = cache_reclaim.r_list.next;
+        cache_entry = list_entry(reclaim, io_cache_entry_t, e_inactive_list);
+        err = alloc_map(cache, cache_entry, cache_entry->e_size, cur_offset);
+        if(err < 0)
+            goto out_undo;
+        err = -1;
+        list_del(&cache_entry->e_inactive_list);
+        --cache_reclaim.r_entries;
+        cache_entry->e_flags &= ~IO_CACHE_LIST_INACTIVE;
+        cache_entry->e_age = IO_CACHE_ENTRY_AGE;
+        active_cache_add_locked(cache, cache_entry, 1); /* sort and add */
+        undo_list[undo_list_entries++] = cache_entry;
+        if(!cache_entry->e_refcnt)
+            ++cache->c_stats.s_locked_entries;
+        cache_entry->e_refcnt += ref;
+        ++cache->c_stats.s_cur_entries;
+        cache->c_stats.s_cur_size += cache_entry->e_size;
+        IO_CACHE_MISS(cache, cache_entry);
+        if(cur_offset < offset)
+            cur_offset = offset;
+        count = MIN(cache_entry->e_offset + cache_entry->e_size - cur_offset, size);
+        cur_offset += count;
+        size -= count;
+    }
+    err = 0;
+    goto out_reclaim;
+    
+    /*
+     * Undo the reference additions here.
+     */
+    out_undo:
+    {
+        long long i;
+        for(i = 0; i < undo_list_entries; ++i)
+        {
+            cache_entry = undo_list[i];
+            if(ref < 0 && !cache_entry->e_refcnt)
+                ++cache->c_stats.s_locked_entries;
+            cache_entry->e_refcnt -= ref;
+            if(ref > 0 && !cache_entry->e_refcnt)
+                --cache->c_stats.s_locked_entries;
+        }
+    }
+    
+    out_reclaim:
+    if(!LIST_EMPTY(&cache_reclaim.r_list))
+    {
+        /*
+         * Reclaim the unused entries back to the inactive list from the reclaim list.
+         */
+        pthread_mutex_unlock(&cache->c_active_mutex);
+        pthread_mutex_lock(&cache->c_inactive_mutex);
+        list_splice(&cache_reclaim.r_list, &cache->c_inactive_list);
+        cache->c_stats.s_inactive_entries += cache_reclaim.r_entries;
+        pthread_mutex_unlock(&cache->c_inactive_mutex);
+    }
+
+    out_free:
+    free(undo_list);
+    
     out:
     return err;
 }
@@ -1124,8 +1348,7 @@ int io_cache_finalize(io_cache_handle_t *handle)
         io_cache_entry_t *cache_entry = list_entry(reclaim_list.next, io_cache_entry_t, e_active_list);
         assert(cache_entry->e_flags & IO_CACHE_LIST_ACTIVE);
         list_del(&cache_entry->e_active_list);
-        IO_CACHE_MUNLOCK(cache_entry->e_data, cache_entry->e_size);
-        munmap(cache_entry->e_data, cache_entry->e_size);
+        free_map(cache, cache_entry);
     }
 
     task_pool_delete(cache->c_io_pool);

@@ -87,7 +87,7 @@ static void test_cache_read_extended(io_cache_handle_t handle, long long block_s
  */
 static void test_cache_read_1(io_cache_handle_t handle, long long block_size)
 {
-    loff_t offsets[] = { 12 << 20LL, 9 << 20LL, 13 << 20LL, 101LL, 37 << 20LL, 283<<20LL, 489<<20LL, 784<<20LL, 0, -1 } ;
+    loff_t offsets[] = { 12 << 20LL, 9 << 20LL, 13 << 20LL, /*101LL,*/ 37 << 20LL, 283<<20LL, 489<<20LL, 784<<20LL, 0, -1 } ;
     loff_t offset=0;
     register int i;
     int err;

@@ -1,5 +1,8 @@
 CC := gcc
 CFLAGS := -Wall -g
+ifeq ($(VALGRIND), 1)
+	CFLAGS += -DVALGRIND
+endif
 LIB_SRCS := io_cache.c task_pool.c
 LIB_OBJS := $(LIB_SRCS:%.c=%.o)
 TST_SRCS := test_iocache.c

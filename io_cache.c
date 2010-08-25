@@ -1245,12 +1245,12 @@ static int __io_cache_entry_lock(io_cache_t *cache, loff_t offset, long long len
     }
     
     out_reclaim:
+    pthread_mutex_unlock(&cache->c_active_mutex);
     if(!LIST_EMPTY(&cache_reclaim.r_list))
     {
         /*
          * Reclaim the unused entries back to the inactive list from the reclaim list.
          */
-        pthread_mutex_unlock(&cache->c_active_mutex);
         pthread_mutex_lock(&cache->c_inactive_mutex);
         list_splice(&cache_reclaim.r_list, &cache->c_inactive_list);
         cache->c_stats.s_inactive_entries += cache_reclaim.r_entries;

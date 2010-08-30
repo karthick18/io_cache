@@ -40,6 +40,7 @@ extern int io_cache_entry_lock(io_cache_handle_t handle, loff_t offset, long lon
 extern int io_cache_entry_unlock(io_cache_handle_t handle, loff_t offset, long long len);
 extern int io_cache_finalize(io_cache_handle_t *handle);
 extern int io_cache_stats_get(io_cache_handle_t handle, io_cache_stats_t *stats);
+extern int io_cache_verify(io_cache_handle_t handle);
 extern void io_cache_log_level_set(int level);
 extern void log_output(FILE *fptr, int level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 

@@ -15,8 +15,12 @@
 #include <string.h>
 #include <assert.h>
 #include <getopt.h>
+#include <errno.h>
 #include <sys/param.h>
+#include <sys/stat.h>
 #include "io_cache.h"
+#undef MIN
+#define MIN(x, y)  ( (x) < (y) ? (x) : (y) )
 
 static long long get_size(const char *s, long long default_size)
 {
@@ -53,25 +57,33 @@ static void dump_io_cache_stats(io_cache_handle_t handle)
            stats.s_hits, stats.s_misses, (double)(stats.s_hits*100.0)/(stats.s_hits+stats.s_misses));
 }
 
-static void test_cache_read_extended(io_cache_handle_t handle, long long block_size)
+static void test_cache_read_extended(io_cache_handle_t handle, long long file_size, long long block_size)
 {
     long long size = block_size;
     char *buffer = malloc(block_size);
     static char *hole;
     int err = 0;
     long long count = 0;
+    long long cur_offset = 0;
+    long long exp_size = 0;
     assert(buffer);
     hole = calloc(1, block_size);
     assert(buffer && hole);
     memset(buffer, 0xa5, block_size);
+    exp_size = MIN(size, file_size);
     while( (err = io_cache_read_extended(handle, buffer, &size)) >= 0
            &&
            size > 0)
     {
+        assert(exp_size == size);
         err = memcmp(buffer, hole, size);
         assert(err == 0);
         printf("Successly read chunk [%lld] of size [%lld]\n", count++, size);
         memset(buffer, 0xa5, size);
+        cur_offset += size;
+        exp_size = size = block_size;
+        exp_size = MIN(size, file_size - cur_offset);
+        if(exp_size < 0) exp_size = 0;
     }
     printf("Sucked in [%lld] chunks %s\n", count, err < 0 ? "after erroring out" : "successfully");
     if(err == 0)
@@ -85,28 +97,41 @@ static void test_cache_read_extended(io_cache_handle_t handle, long long block_s
 /*
  * Exercise random cache reads from files 
  */
-static void test_cache_read_1(io_cache_handle_t handle, long long block_size)
+static void test_cache_read_1(io_cache_handle_t handle, long long file_size, long long block_size)
 {
-    loff_t offsets[] = { 12 << 20LL, 9 << 20LL, 13 << 20LL, /*101LL,*/ 37 << 20LL, 283<<20LL, 489<<20LL, 784<<20LL, 0, -1 } ;
+    loff_t offsets[] = { 12 << 20LL, 9 << 20LL, 13 << 20LL, 101LL, 37 << 20LL, 283<<20LL, 489<<20LL, 784<<20LL, 0, 1024LL<<20, 1023LL<<20, 1022LL<<20, (1024LL<<20)-3, (1024LL<<20)-1, (1024LL<<20)-7, -1 } ;
     loff_t offset=0;
     register int i;
-    int err;
+    int err,count=0;
     long long size = block_size;
+    long long exp_size = 0;
     char *buffer = malloc(block_size);
     static char *hole;
     hole = calloc(1, block_size);
     assert(buffer && hole);
-    memset(buffer, 0xa5, block_size);
-    for( i = 0; (offset=offsets[i]) >= 0; ++i)
+    while(count++ < 5)
     {
-        fprintf(stderr, "Testing cache read with offset [%lld] bytes\n", (long long int)offset);
-        err = io_cache_read(handle, buffer, offset, &size);
-        assert(err == 0);
-        assert(size == block_size);
-        err = memcmp(buffer, hole, size);
-        assert(err == 0);
+        fprintf(stderr, "Testing cache read iteration [%d]\n", count);
+        for( i = 0; (offset=offsets[i]) >= 0; ++i)
+        {
+            size = block_size;
+            exp_size = MIN(size, file_size - offset);
+            if(exp_size < 0)
+                exp_size = 0;
+            memset(buffer, 0xa5, block_size);
+            fprintf(stderr, "Testing cache read with offset [%lld] bytes\n", (long long int)offset);
+            err = io_cache_read(handle, buffer, offset, &size);
+            fprintf(stderr, "Cache read with offset [%lld] bytes read [%lld] bytes\n", 
+                    (long long int)offset, size);
+            assert(err == 0);
+            assert(size == exp_size);
+            err = memcmp(buffer, hole, size);
+            assert(err == 0);
+        }
+        sleep(5);
     }
     fprintf(stderr, "Test cache read 1 success...\n");
+    dump_io_cache_stats(handle);
 }
 
 static char *prog;
@@ -145,8 +170,11 @@ int main(int argc, char **argv)
     int c;
     long long block_size = 16<<20LL;
     long long cache_size = 128<<20LL;
+    long long file_size = 0;
     char filename[PATH_MAX];
     char log_level[40];
+    struct stat stbuf;
+
     if( (prog = strrchr(argv[0], '/') ) )
         ++prog;
     else prog = argv[0];
@@ -181,14 +209,20 @@ int main(int argc, char **argv)
         usage();
 
     io_cache_log_level_set(str_to_level(log_level));
-    printf("IO cache test read buffer block size [%lld] bytes, cache_size [%lld] bytes\n", 
-           block_size, cache_size);
+    if(stat(filename, &stbuf))
+    {
+        fprintf(stderr, "Error [%s] stating file [%s]\n", strerror(errno), filename);
+        return -1;
+    }
+    file_size = (long long)stbuf.st_size;
+    printf("IO cache test read buffer block size [%lld] bytes, cache_size [%lld] bytes, filesize [%lld] bytes\n", 
+           block_size, cache_size, file_size);
     err = io_cache_initialize(filename, cache_size, NULL, &handle);
     assert(err == 0);
-    test_cache_read_extended(handle, block_size);
+    test_cache_read_extended(handle, file_size, block_size);
     err = io_cache_offset_set(handle, 0); 
     assert(err == 0);
-    test_cache_read_1(handle, block_size);
+    test_cache_read_1(handle, file_size, block_size);
     err = io_cache_finalize(&handle);
     assert(err == 0);
     return 0;

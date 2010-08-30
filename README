@@ -1,4 +1,3 @@
-A fast read-only io-cache for processing large files preferably over 1GB and above. User needn't focus on efficiently managing and reading the data off the file and could instead focus on processing his large data-sets in such files.
-Check test_iocache.c for usage. This is the first version and isn't stable.
+A fast io-cache for post-processing and reading large files preferably over 1GB and above. User needn't focus on efficiently managing and reading the data off the file and maintain his own read buffers. He could instead focus on processing his large data-sets in such files where he could be expected to randomly iterate and read over his data-sets stored in the file for processing. The cache can be initialized upto a maximum of 4 GB. The limit specified should also be less than 50% of available memory in the system. The APIs to initialize/read/lock the io_cache can be found in io_cache.h. A sample usage can be seen in test_iocache.c.
 
--Karthick (a.r.karthick@gmail.com)
+-A.R.Karthick (a.r.karthick@gmail.com, a_r_karthic@users.sourceforge.net)

@@ -2,7 +2,7 @@
  * Test file for io-cache. Currently io-cache fails random cache reads coz of a memory corruption in the cache
  * active list.
  * Breaking my head on it as test: test_cache_read_1 fails.
- * Create a 1 GIG file like: dd if=/dev/zero of=test.out bs=1M count=1024
+ * Create a 1 GB file (minimum) like: dd if=/dev/zero of=test.out bs=1M count=1024
  * And then run the test as: ./test_iocache -f test.out -b 16m -c 256m -l debug
  * The above would run a test on the file test.out using 16 mb reads by configuring the io-cache
  * of 256 mb with log level debug.

@@ -1,31 +1,13 @@
-/*   io_cache : A read only io-cache and reading mechanism expected to be used with LARGE file sizes
-;    preferably >= 1 GB.
-;
-;    Copyright (C) 2010-2011 A.R.Karthick 
-;    <a.r.karthick@gmail.com, a_r_karthic@users.sourceforge.net>
-;
-;    This program is free software; you can redistribute it and/or modify
-;    it under the terms of the GNU General Public License as published by
-;    the Free Software Foundation; either version 2 of the License, or
-;    (at your option) any later version.
-;
-;    This program is distributed in the hope that it will be useful,
-;    but WITHOUT ANY WARRANTY; without even the implied warranty of
-;    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-;    GNU General Public License for more details.
-;
-;    You should have received a copy of the GNU General Public License
-;    along with this program; if not, write to the Free Software
-;    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-;
-;
-*/
-/*
+/*   
+ * io_cache : A read only io-cache expected to be used with LARGE file sizes
+ * preferably >= 1 GB.
+ *
  * The io-cache uses a fixed mmap chunk size of 4MB to scatter gather the IOs/file reads
  * The maximum size of the cache is 4GB or 1024 entries of 4MB each. 
  * The cache has an aging thread associated with it that cleans up unused references in the file.
- * The cache could be used when a user expects to process large data sets stored in files without worrying
- * about the maintenance of such a large file.
+ * The cache could be used when a user expects to read and process large data sets stored in files without worrying
+ * about the maintenance of the read buffers for such a large file when you are expected to iterate over your data-set
+ * and retain them for post-processing or later reference.
  */
 
 #include <stdio.h>

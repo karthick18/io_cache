@@ -7,7 +7,7 @@ LIB_SRCS := io_cache.c task_pool.c
 LIB_OBJS := $(LIB_SRCS:%.c=%.o)
 TST_SRCS := test_iocache.c
 TST_OBJS := $(TST_SRCS:%.c=%.o)
-LD_LIBS := -lrt -lpthread -L./. -liocache
+LD_LIBS := -L./. -liocache -lpthread -lrt 
 TARGET := libiocache.a test_iocache
 
 all: $(TARGET)
